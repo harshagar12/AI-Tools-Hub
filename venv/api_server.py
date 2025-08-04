@@ -2,7 +2,7 @@
 Enhanced FastAPI server with proper audio file handling and background music mixing
 """
 
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import FileResponse
@@ -25,14 +25,27 @@ from imagekitio import ImageKit
 from imagekitio.models.UploadFileRequestOptions import UploadFileRequestOptions
 import requests
 from pydub import AudioSegment
+import soundfile as sf
+import numpy as np
 from io import BytesIO
 
 # Load environment variables
 load_dotenv()
 
 # Configure logging exactly like Streamlit
-logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# Add file handler
+fh = logging.handlers.RotatingFileHandler(
+    'api_server.log',
+    maxBytes=10485760,  # 10MB
+    backupCount=5
+)
+fh.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+fh.setFormatter(formatter)
+logger.addHandler(fh)
 
 # Configure FFmpeg paths exactly like Streamlit
 FFMPEG_PATH = os.getenv('FFMPEG_PATH', 'C:\\ffmpeg\\bin\\ffmpeg.exe')
@@ -69,19 +82,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# API Keys and Configuration - using exact same variable names as Streamlit
+# API Keys and Configuration
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "unified_ai")
-GOOGLE_API_KEY = os.getenv("google_api")  # Note: using "google_api" like Streamlit
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") 
 AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
 AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
 IMAGEKIT_PRIVATE_KEY = os.getenv("IMAGEKIT_PRIVATE_KEY")
 IMAGEKIT_PUBLIC_KEY = os.getenv("IMAGEKIT_PUBLIC_KEY")
 IMAGEKIT_URL_ENDPOINT = os.getenv("IMAGEKIT_URL_ENDPOINT")
-
-# Configure services
-if GOOGLE_API_KEY:
-    genai.configure(api_key=GOOGLE_API_KEY)
 
 # Initialize ImageKit
 imagekit = None
@@ -116,9 +125,6 @@ class UserCreate(BaseModel):
 class UserLogin(BaseModel):
     username: str
     password: str
-
-class ChatRequest(BaseModel):
-    message: str
 
 class ActivityRequest(BaseModel):
     activity_type: str
@@ -211,19 +217,6 @@ def store_activity(username: str, activity_type: str, details: dict, output_url:
         logger.error(f"Error storing activity: {e}")
         return False
 
-def get_gemini_response(question: str) -> str:
-    """Get response from Google Gemini AI"""
-    try:
-        if not GOOGLE_API_KEY:
-            raise Exception("Google API key not configured")
-        
-        model = genai.GenerativeModel("gemini-2.0-flash")
-        response = model.generate_content(question)
-        return response.text
-    except Exception as e:
-        logger.error(f"Gemini API error: {e}")
-        raise HTTPException(status_code=500, detail="AI service temporarily unavailable")
-
 # Text-to-Speech Functions - copied exactly from Streamlit
 
 def get_available_voices(api_key, region):
@@ -294,7 +287,7 @@ def search_background_music(query, freesound_api_key):
         logger.error(f"Error in search_background_music: {str(e)}")
         return []
 
-def download_and_process_audio(preview_url, volume_reduction=15):
+def download_and_process_audio(preview_url):
     """Download and process audio - with increased volume reduction"""
     temp_path = None
     try:
@@ -315,12 +308,12 @@ def download_and_process_audio(preview_url, volume_reduction=15):
             temp_path = temp_file.name
             
         try:
-            logger.info("Loading MP3 with pydub...")
+            logger.info("Loading MP3...")
             audio = AudioSegment.from_mp3(temp_path)
             logger.info(f"Original audio: {len(audio)}ms, {audio.dBFS}dB")
             
             # Reduce volume significantly
-            processed_audio = audio - volume_reduction
+            processed_audio = audio
             logger.info(f"Processed audio: {len(processed_audio)}ms, {processed_audio.dBFS}dB")
             
             return processed_audio
@@ -353,7 +346,7 @@ def mix_audio(speech_path, background_music, output_path="final_output.wav"):
         logger.info(f"Background music adjusted to: {len(background_music)}ms")
         
         # Reduce background music volume significantly more to ensure speech is prominent
-        background_music = background_music - 10  
+        background_music = background_music - 2  
         logger.info(f"Background music volume after reduction: {background_music.dBFS}dB")
         
         # Boost speech volume slightly if needed
@@ -376,6 +369,66 @@ def mix_audio(speech_path, background_music, output_path="final_output.wav"):
         import traceback
         logger.error(f"Full traceback: {traceback.format_exc()}")
         return None
+
+def mix_audio_enhanced(speech_path, background_music, output_path="final_output.wav"):
+    """Enhanced audio mixing using soundfile and numpy"""
+    try:
+        # Load speech file
+        logger.info(f"Loading speech from: {speech_path}")
+        speech_data, speech_rate = sf.read(speech_path)
+        
+        # Convert background music to numpy array
+        bg_data = np.array(background_music.get_array_of_samples())
+        bg_data = bg_data.astype(np.float32)
+        
+        # Normalize both arrays to float32
+        speech_data = speech_data.astype(np.float32)
+        bg_data = bg_data.astype(np.float32)
+        
+        # Normalize volumes
+        speech_data /= np.max(np.abs(speech_data))
+        bg_data /= np.max(np.abs(bg_data))
+        
+        # Adjust background music length
+        if len(bg_data) < len(speech_data):
+            bg_data = np.tile(bg_data, (len(speech_data) // len(bg_data)) + 1)
+        bg_data = bg_data[:len(speech_data)]
+        
+        # Apply volume adjustments
+        speech_volume = 0.75  # Keep speech at full volume
+        bg_volume = 1.0    # Reduce background to 80%
+        
+        # Mix audio with adjusted volumes
+        bg_data *= bg_volume
+        speech_data *= speech_volume
+        mixed_data = speech_data + bg_data
+        
+        # Prevent clipping
+        max_val = np.max(np.abs(mixed_data))
+        if max_val > 1.0:
+            mixed_data /= max_val
+        
+        # Save mixed audio
+        final_path = os.path.join("temp_audio", output_path)
+        sf.write(final_path, mixed_data, speech_rate)
+        
+        # Save background music separately
+        bg_output_path = f"bg_{output_path}"
+        bg_final_path = os.path.join("temp_audio", bg_output_path)
+        # Normalize background music for standalone playback
+        bg_data_normalized = bg_data / np.max(np.abs(bg_data))
+        sf.write(bg_final_path, bg_data_normalized, speech_rate)
+        
+        logger.info(f"Successfully mixed audio to: {final_path}")
+        logger.info(f"Background music saved to: {bg_final_path}")
+        
+        return final_path, bg_final_path
+        
+    except Exception as e:
+        logger.error(f"Error in mix_audio_enhanced: {str(e)}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        return None, None
 
 # API Routes
 
@@ -470,27 +523,6 @@ async def login(user: UserLogin):
 async def get_me(current_user: dict = Depends(get_current_user)):
     """Get current user information"""
     return UserResponse(username=current_user["username"], email=current_user["email"])
-
-@app.post("/api/chat")
-async def chat(request: ChatRequest, current_user: dict = Depends(get_current_user)):
-    """Handle chat messages"""
-    try:
-        response = get_gemini_response(request.message)
-        
-        # Store activity
-        store_activity(
-            current_user["username"],
-            "chat",
-            {"user_message": request.message, "bot_response": response}
-        )
-        
-        return {"response": response}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Chat error: {e}")
-        raise HTTPException(status_code=500, detail="Chat service temporarily unavailable")
 
 @app.post("/api/activities")
 async def get_activities(request: ActivityRequest, current_user: dict = Depends(get_current_user)):
@@ -723,15 +755,18 @@ async def text_to_speech(request: TTSRequest, current_user: dict = Depends(get_c
         final_output_filename = f"final_output_{timestamp}.wav"
         
         # Mix audio using unique filename
-        final_output = mix_audio(speech_file, background_music, final_output_filename)
-        if not final_output:
+        final_output, bg_output = mix_audio_enhanced(speech_file, background_music, final_output_filename)
+        if not final_output or not bg_output:
             raise HTTPException(status_code=500, detail="Failed to mix audio.")
 
         logger.info("Audio processing complete!")
         
-        # Get just the filename for the URL
+        # Get filenames for URLs
         final_filename = os.path.basename(final_output)
+        bg_filename = os.path.basename(bg_output)
+        
         audio_url = f"/audio/{final_filename}"
+        bg_audio_url = f"/audio/{bg_filename}"
         
         # Store activity exactly like Streamlit
         store_activity(
@@ -755,9 +790,11 @@ async def text_to_speech(request: TTSRequest, current_user: dict = Depends(get_c
             "audio_url": audio_url,
             "background_music": {
                 "name": selected_music["name"],
-                "duration": selected_music["duration"]
+                "duration": selected_music["duration"],
+                "audio_url": bg_audio_url
             },
             "filename": final_filename,
+            "bg_filename": bg_filename,
             "has_background_music": True,
             "selected_track": selected_track_name
         }
@@ -853,7 +890,7 @@ async def test_audio_mixing(current_user: dict = Depends(get_current_user)):
             return {"error": "Failed to process background music"}
         
         # Test mixing
-        mixed_file = mix_audio(speech_file, background_music, "test_mixed.wav")
+        mixed_file = mix_audio_enhanced(speech_file, background_music, "test_mixed.wav")
         
         if mixed_file:
             return {

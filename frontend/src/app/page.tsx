@@ -23,11 +23,18 @@ interface Activity {
   output_url?: string
 }
 
-interface ChatMessage {
-  id: string
-  role: "user" | "bot"
-  content: string
-  timestamp: string
+// Add this interface near the top with other interfaces
+interface TTSResponse {
+  audio_url: string;
+  background_music: {
+    name: string;
+    duration: number;
+    audio_url: string;
+  };
+  filename: string;
+  bg_filename: string;
+  has_background_music: boolean;
+  selected_track: string;
 }
 
 // Simple form state management without external hook
@@ -52,11 +59,6 @@ export default function AIToolsHub() {
   const [activities, setActivities] = useState<Activity[]>([])
   const [loading, setLoading] = useState(false)
   const [authToken, setAuthToken] = useState<string | null>(null)
-
-  // Chatbot state
-  const [messages, setMessages] = useState<ChatMessage[]>([])
-  const chatForm = useFormInput({ message: "" })
-  const chatContainerRef = useRef<HTMLDivElement>(null)
 
   // Photo Editor state
   const [uploadedImage, setUploadedImage] = useState<string | null>(null)
@@ -158,7 +160,7 @@ export default function AIToolsHub() {
         setAuthToken(data.access_token)
         setUser(data.user)
         localStorage.setItem("auth_token", data.access_token)
-        setCurrentPage("chatbot")
+        setCurrentPage("photo-editor")
         loginForm.reset()
       } else {
         setAuthError(data.error || "Login failed")
@@ -239,72 +241,10 @@ export default function AIToolsHub() {
   const handleLogout = () => {
     setUser(null)
     setCurrentPage("login")
-    setMessages([])
     setActivities([])
     localStorage.removeItem("auth_token")
     setAuthToken(null)
   }
-
-  const sendMessage = useCallback(async () => {
-    if (!chatForm.values.message.trim() || !user || loading) return
-
-    const userMessage: ChatMessage = {
-      id: Date.now().toString(),
-      role: "user",
-      content: chatForm.values.message.trim(),
-      timestamp: new Date().toISOString(),
-    }
-
-    setMessages((prev) => [...prev, userMessage])
-    const currentInput = chatForm.values.message.trim()
-    chatForm.setValue("message", "") // Clear the input
-    setLoading(true)
-
-    try {
-      const response = await fetch(`${API_BASE}/api/chat`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${authToken}`,
-        },
-        body: JSON.stringify({
-          message: currentInput,
-        }),
-      })
-
-      const data = await response.json()
-
-      if (response.ok) {
-        const botMessage: ChatMessage = {
-          id: (Date.now() + 1).toString(),
-          role: "bot",
-          content: data.response,
-          timestamp: new Date().toISOString(),
-        }
-        setMessages((prev) => [...prev, botMessage])
-        fetchActivities()
-      } else {
-        const errorMessage: ChatMessage = {
-          id: (Date.now() + 1).toString(),
-          role: "bot",
-          content: "Sorry, I encountered an error. Please try again.",
-          timestamp: new Date().toISOString(),
-        }
-        setMessages((prev) => [...prev, errorMessage])
-      }
-    } catch (error) {
-      console.error("Chat error:", error)
-      const errorMessage: ChatMessage = {
-        id: (Date.now() + 1).toString(),
-        role: "bot",
-        content: "Sorry, I'm having trouble connecting. Please try again.",
-        timestamp: new Date().toISOString(),
-      }
-      setMessages((prev) => [...prev, errorMessage])
-    } finally {
-      setLoading(false)
-    }
-  }, [chatForm.values.message, user, loading, authToken, fetchActivities, chatForm])
 
   // Image handling functions
   const handleDrag = (e: React.DragEvent) => {
@@ -411,11 +351,13 @@ export default function AIToolsHub() {
   }
 
   // Fixed Text-to-Speech functions to prevent audio interruption
-  const generateSpeech = useCallback(async () => {
-    if (!ttsForm.values.text.trim() || !user) return
+  const [ttsResponse, setTtsResponse] = useState<TTSResponse | null>(null);
 
-    setLoading(true)
-    const previousAudioUrl = audioUrl
+  const generateSpeech = useCallback(async () => {
+    if (!ttsForm.values.text.trim() || !user) return;
+
+    setLoading(true);
+    const previousAudioUrl = audioUrl;
 
     try {
       const response = await fetch(`${API_BASE}/api/text-to-speech`, {
@@ -429,9 +371,10 @@ export default function AIToolsHub() {
           voice: selectedVoice,
           music_search: ttsForm.values.music,
         }),
-      })
+      });
 
-      const data = await response.json()
+      const data = await response.json();
+      setTtsResponse(data); // Store the response data
 
       if (response.ok) {
         if (previousAudioUrl && previousAudioUrl.startsWith("blob:")) {
@@ -632,14 +575,6 @@ export default function AIToolsHub() {
               </div>
               {user && (
                 <div className="flex space-x-4 items-center">
-                  <Button
-                    variant={currentPage === "chatbot" ? "default" : "ghost"}
-                    onClick={() => setCurrentPage("chatbot")}
-                    className="flex items-center gap-2"
-                  >
-                    <MessageCircle size={16} />
-                    Chatbot
-                  </Button>
                   <Button
                     variant={currentPage === "photo-editor" ? "default" : "ghost"}
                     onClick={() => setCurrentPage("photo-editor")}
@@ -867,71 +802,6 @@ export default function AIToolsHub() {
     [authError, signupForm.values, handleSignup, signupForm.handleChange, loading],
   )
 
-  const ChatbotPage = useMemo(
-    () => (
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-[calc(100vh-8rem)]">
-        <div className="lg:col-span-2">
-          <Card className="h-full flex flex-col">
-            <CardHeader>
-              <CardTitle>AI Chatbot</CardTitle>
-            </CardHeader>
-            <CardContent className="flex-1 flex flex-col">
-              <div ref={chatContainerRef} className="flex-1 overflow-y-auto space-y-4 mb-4 p-4 bg-gray-50 rounded-lg">
-                {messages.length === 0 && (
-                  <div className="text-center text-gray-500 py-8">Start a conversation with the AI assistant!</div>
-                )}
-                {messages.map((message) => (
-                  <div key={message.id} className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}>
-                    <div
-                      className={`max-w-xs lg:max-w-md px-4 py-2 rounded-lg ${
-                        message.role === "user" ? "bg-blue-500 text-white" : "bg-white text-gray-800 border"
-                      }`}
-                    >
-                      <div className="whitespace-pre-wrap">{message.content}</div>
-                      <div className="text-xs opacity-70 mt-1">{new Date(message.timestamp).toLocaleTimeString()}</div>
-                    </div>
-                  </div>
-                ))}
-                {loading && (
-                  <div className="flex justify-start">
-                    <div className="bg-white text-gray-800 border px-4 py-2 rounded-lg">
-                      <div className="flex items-center space-x-2">
-                        <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-900"></div>
-                        <span>AI is thinking...</span>
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </div>
-              <div className="flex gap-2">
-                <Input
-                  name="message"
-                  placeholder="Type your message..."
-                  value={chatForm.values.message}
-                  onChange={chatForm.handleChange}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey && !loading) {
-                      e.preventDefault()
-                      sendMessage()
-                    }
-                  }}
-                  className="flex-1"
-                  disabled={loading}
-                  autoComplete="off"
-                />
-                <Button onClick={sendMessage} disabled={loading || !chatForm.values.message.trim()}>
-                  <Send size={16} />
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-        <ActivityHistory />
-      </div>
-    ),
-    [messages, loading, chatForm.values.message, chatForm.handleChange, sendMessage],
-  )
-
   const PhotoEditorPage = useMemo(
     () => (
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-[calc(100vh-8rem)]">
@@ -1145,38 +1015,54 @@ export default function AIToolsHub() {
               <CardHeader>
                 <CardTitle>Audio Player</CardTitle>
               </CardHeader>
-              <CardContent className="space-y-4">
-                <audio
-                  ref={audioRef}
-                  src={audioUrl}
-                  controls
-                  className="w-full"
-                  onPlay={() => setIsPlaying(true)}
-                  onPause={() => setIsPlaying(false)}
-                  onEnded={() => setIsPlaying(false)}
-                />
-
-                <div className="flex flex-col gap-2">
+              <CardContent className="space-y-6">
+                {/* Main mixed audio */}
+                <div className="space-y-2">
+                  <h3 className="text-sm font-medium">Mixed Audio (Speech with Music)</h3>
+                  <audio
+                    ref={audioRef}
+                    src={audioUrl}
+                    controls
+                    className="w-full"
+                    onPlay={() => setIsPlaying(true)}
+                    onPause={() => setIsPlaying(false)}
+                    onEnded={() => setIsPlaying(false)}
+                  />
                   <Button variant="outline" size="sm" onClick={downloadAudio} disabled={!audioUrl}>
-                    <Download size={16} />
+                    <Download size={16} className="mr-2" />
+                    Download Mixed Audio
                   </Button>
                 </div>
 
-                <div className="text-sm text-gray-600">
-                  <p>
-                    <strong>Text:</strong> {ttsForm.values.text.substring(0, 100)}
-                    {ttsForm.values.text.length > 100 ? "..." : ""}
-                  </p>
-                  <p>
-                    <strong>Voice:</strong>{" "}
-                    {availableVoices.find((v) => v.name === selectedVoice)?.display_name || selectedVoice}
-                  </p>
-                  {audioBlob && (
-                    <p>
-                      <strong>Audio Size:</strong> {(audioBlob.size / 1024).toFixed(1)} KB
-                    </p>
-                  )}
-                </div>
+                {/* Background music only */}
+                {ttsResponse?.background_music?.audio_url && (
+                  <div className="space-y-2">
+                    <h3 className="text-sm font-medium">Background Music Only</h3>
+                    <audio
+                      src={`${API_BASE}${ttsResponse.background_music.audio_url}`}
+                      controls
+                      className="w-full"
+                    />
+                    <div className="text-sm text-gray-500">
+                      Track: {ttsResponse.background_music.name}
+                    </div>
+                    <Button 
+                      variant="outline" 
+                      size="sm" 
+                      onClick={() => {
+                        const a = document.createElement("a");
+                        a.href = `${API_BASE}${ttsResponse.background_music.audio_url}`;
+                        a.download = `background_${Date.now()}.wav`;
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                      }}
+                    >
+                      <Download size={16} className="mr-2" />
+                      Download Background Music
+                    </Button>
+                  </div>
+                )}
               </CardContent>
             </Card>
           )}
@@ -1243,14 +1129,10 @@ export default function AIToolsHub() {
         return LoginPage
       case "signup":
         return SignupPage
-      case "chatbot":
-        return ChatbotPage
       case "photo-editor":
         return PhotoEditorPage
       case "text-to-speech":
         return TextToSpeechPage
-      case "file-upload":
-        return FileUploadPage
       default:
         return LoginPage
     }
