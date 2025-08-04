@@ -28,6 +28,9 @@ from pydub import AudioSegment
 import soundfile as sf
 import numpy as np
 from io import BytesIO
+import yt_dlp
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 # Load environment variables
 load_dotenv()
@@ -62,10 +65,12 @@ app = FastAPI(title="AI Tools Hub API", version="1.0.0")
 # Create directories for file storage
 os.makedirs("temp_audio", exist_ok=True)
 os.makedirs("temp_images", exist_ok=True)
+os.makedirs("temp_downloads", exist_ok=True)
 
 # Mount static files
 app.mount("/audio", StaticFiles(directory="temp_audio"), name="audio")
 app.mount("/images", StaticFiles(directory="temp_images"), name="images")
+app.mount("/downloads", StaticFiles(directory="temp_downloads"), name="downloads")
 
 # Security
 security = HTTPBearer()
@@ -133,6 +138,15 @@ class TTSRequest(BaseModel):
     text: str
     voice: str
     music_search: Optional[str] = ""
+
+class YouTubeDownloadRequest(BaseModel):
+    url: str
+    quality: Optional[str] = "720p"
+    format: Optional[str] = "mp4"
+
+class YouTubeAudioRequest(BaseModel):
+    url: str
+    format: Optional[str] = "mp3"
 
 class Token(BaseModel):
     access_token: str
@@ -429,6 +443,198 @@ def mix_audio_enhanced(speech_path, background_music, output_path="final_output.
         import traceback
         logger.error(f"Full traceback: {traceback.format_exc()}")
         return None, None
+
+# YouTube Download Functions
+
+def validate_youtube_url(url: str) -> bool:
+    """Validate if URL is a valid YouTube URL"""
+    youtube_patterns = [
+        r'(?:https?://)?(?:www\.)?youtube\.com/watch\?v=[\w-]+',
+        r'(?:https?://)?(?:www\.)?youtu\.be/[\w-]+',
+        r'(?:https?://)?(?:www\.)?youtube\.com/embed/[\w-]+',
+        r'(?:https?://)?(?:www\.)?youtube\.com/v/[\w-]+',
+    ]
+    
+    for pattern in youtube_patterns:
+        if re.match(pattern, url):
+            return True
+    return False
+
+def get_video_info(url: str) -> dict:
+    """Get video information with comprehensive format detection"""
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            # Comprehensive format collection
+            formats = []
+            seen_qualities = set()
+            
+            # 1. Get video formats with audio (best quality first)
+            video_formats = []
+            for f in info.get('formats', []):
+                if f.get('height') and f.get('acodec') != 'none':
+                    quality = f"{f['height']}p"
+                    if quality not in seen_qualities:
+                        video_formats.append({
+                            'format_id': f['format_id'],
+                            'quality': quality,
+                            'ext': f.get('ext', 'mp4'),
+                            'has_audio': True,
+                            'has_video': True,
+                            'filesize': f.get('filesize', 0),
+                            'abr': f.get('abr', 0)
+                        })
+                        seen_qualities.add(quality)
+            
+            # Sort video formats by quality (1080p → 360p)
+            video_formats.sort(key=lambda x: int(x['quality'].replace('p', '')), reverse=True)
+            formats.extend(video_formats)
+            
+            # 2. Add audio-only formats
+            audio_formats = []
+            for f in info.get('formats', []):
+                if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
+                    abr = f.get('abr', 0)
+                    if abr > 0:  # Only include formats with bitrate info
+                        audio_formats.append({
+                            'format_id': f['format_id'],
+                            'quality': f"{int(abr)}kbps",
+                            'ext': f.get('ext', 'mp3'),
+                            'has_audio': True,
+                            'has_video': False,
+                            'abr': abr
+                        })
+            
+            # Sort audio by bitrate (highest first)
+            audio_formats.sort(key=lambda x: x['abr'], reverse=True)
+            formats.extend(audio_formats[:3])  # Limit to top 3 audio formats
+            
+            # Ensure we have at least basic formats if nothing was found
+            if not formats:
+                formats = [
+                    {'format_id': '18', 'quality': '360p', 'ext': 'mp4', 'has_audio': True, 'has_video': True},
+                    {'format_id': '140', 'quality': '128kbps', 'ext': 'm4a', 'has_audio': True, 'has_video': False}
+                ]
+            
+            return {
+                'title': info.get('title', 'Unknown'),
+                'duration': info.get('duration', 0),
+                'uploader': info.get('uploader', 'Unknown'),
+                'view_count': info.get('view_count', 0),
+                'formats': formats,
+                'thumbnail': info.get('thumbnail', '')
+            }
+            
+    except Exception as e:
+        logger.error(f"Error getting video info: {e}")
+        return None
+
+def download_youtube_video(url: str, quality: str = "720p", output_dir: str = "temp_downloads") -> tuple[str, dict]:
+    """Download YouTube video with proper format selection"""
+    try:
+        timestamp = int(datetime.now().timestamp())
+        
+        # Updated format selection that works with current YouTube
+        if quality == "best":
+            format_selector = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+        else:
+            height = quality.replace('p', '')
+            format_selector = f'bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}]/best'
+        
+        ydl_opts = {
+            'format': format_selector,
+            'outtmpl': os.path.join(output_dir, f'video_{timestamp}_%(title)s.%(ext)s'),
+            'restrictfilenames': True,
+            'noplaylist': True,
+            'merge_output_format': 'mp4',  # Ensure merged output is MP4
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            ydl.download([url])
+            
+            # Find the downloaded file
+            expected_filename = ydl.prepare_filename(info)
+            
+            if os.path.exists(expected_filename):
+                filename = os.path.basename(expected_filename)
+                return filename, {
+                    'title': info.get('title', 'Unknown'),
+                    'duration': info.get('duration', 0),
+                    'uploader': info.get('uploader', 'Unknown'),
+                    'quality': quality,
+                    'format': info.get('ext', 'mp4')
+                }
+            else:
+                # Try to find any video file created around this time
+                for file in os.listdir(output_dir):
+                    if file.startswith(f'video_{timestamp}') and file.endswith(('.mp4', '.webm', '.mkv')):
+                        return file, {
+                            'title': info.get('title', 'Unknown'),
+                            'duration': info.get('duration', 0),
+                            'uploader': info.get('uploader', 'Unknown'),
+                            'quality': quality,
+                            'format': file.split('.')[-1]
+                        }
+                
+                raise Exception("Downloaded file not found")
+                
+    except Exception as e:
+        logger.error(f"Error downloading video: {e}")
+        return None, None
+
+def download_youtube_audio(url: str, format: str = "mp3", output_dir: str = "temp_downloads") -> tuple[str, dict]:
+    """Download YouTube audio"""
+    try:
+        # Create unique filename
+        timestamp = int(datetime.now().timestamp())
+        
+        # Configure yt-dlp options for audio
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': os.path.join(output_dir, f'audio_{timestamp}_%(title)s.%(ext)s'),
+            'restrictfilenames': True,
+            'noplaylist': True,
+            'extract_flat': False,
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': format,
+                'preferredquality': '192',
+            }],
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Get info first
+            info = ydl.extract_info(url, download=False)
+            
+            # Download and convert to audio
+            ydl.download([url])
+            
+            # Find the downloaded audio file
+            for file in os.listdir(output_dir):
+                if file.startswith(f'audio_{timestamp}') and file.endswith(f'.{format}'):
+                    return file, {
+                        'title': info.get('title', 'Unknown'),
+                        'duration': info.get('duration', 0),
+                        'uploader': info.get('uploader', 'Unknown'),
+                        'format': format
+                    }
+            
+            raise Exception("Downloaded audio file not found")
+                
+    except Exception as e:
+        logger.error(f"Error downloading audio: {e}")
+        return None, None
+
+# Create thread pool for async operations
+executor = ThreadPoolExecutor(max_workers=3)
 
 # API Routes
 
@@ -854,6 +1060,150 @@ async def upload_file(
     except Exception as e:
         logger.error(f"File upload error: {e}")
         raise HTTPException(status_code=500, detail="File upload failed")
+
+@app.post("/api/youtube-info")
+async def get_youtube_info(request: YouTubeDownloadRequest, current_user: dict = Depends(get_current_user)):
+    """Get YouTube video information"""
+    try:
+        if not validate_youtube_url(request.url):
+            raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+        
+        # Run in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(executor, get_video_info, request.url)
+        
+        if not info:
+            raise HTTPException(status_code=400, detail="Could not retrieve video information")
+        
+        return {"info": info}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"YouTube info error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get video information")
+
+@app.post("/api/youtube-download/video")
+async def download_youtube_video_endpoint(request: YouTubeDownloadRequest, current_user: dict = Depends(get_current_user)):
+    """Download YouTube video"""
+    try:
+        if not validate_youtube_url(request.url):
+            raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+        
+        # Run download in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        filename, info = await loop.run_in_executor(
+            executor, 
+            download_youtube_video, 
+            request.url, 
+            request.quality
+        )
+        
+        if not filename:
+            raise HTTPException(status_code=500, detail="Failed to download video")
+        
+        # Store activity
+        store_activity(
+            current_user["username"],
+            "youtube_download",
+            {
+                "type": "video",
+                "url": request.url,
+                "quality": request.quality,
+                "title": info.get("title", "Unknown"),
+                "duration": info.get("duration", 0)
+            },
+            f"/downloads/{filename}"
+        )
+        
+        return {
+            "filename": filename,
+            "download_url": f"/downloads/{filename}",
+            "info": info,
+            "message": "Video downloaded successfully"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"YouTube video download error: {e}")
+        raise HTTPException(status_code=500, detail="Video download failed")
+
+@app.post("/api/youtube-download/audio")
+async def download_youtube_audio_endpoint(request: YouTubeAudioRequest, current_user: dict = Depends(get_current_user)):
+    """Download YouTube audio"""
+    try:
+        if not validate_youtube_url(request.url):
+            raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+        
+        # Run download in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        filename, info = await loop.run_in_executor(
+            executor, 
+            download_youtube_audio, 
+            request.url, 
+            request.format
+        )
+        
+        if not filename:
+            raise HTTPException(status_code=500, detail="Failed to download audio")
+        
+        # Store activity
+        store_activity(
+            current_user["username"],
+            "youtube_download",
+            {
+                "type": "audio",
+                "url": request.url,
+                "format": request.format,
+                "title": info.get("title", "Unknown"),
+                "duration": info.get("duration", 0)
+            },
+            f"/downloads/{filename}"
+        )
+        
+        return {
+            "filename": filename,
+            "download_url": f"/downloads/{filename}",
+            "info": info,
+            "message": "Audio downloaded successfully"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"YouTube audio download error: {e}")
+        raise HTTPException(status_code=500, detail="Audio download failed")
+
+@app.get("/api/download-file/{filename}")
+async def download_file(filename: str, current_user: dict = Depends(get_current_user)):
+    """Download file from temp_downloads directory"""
+    try:
+        filepath = os.path.join("temp_downloads", filename)
+        if not os.path.exists(filepath):
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # Determine media type based on file extension
+        ext = filename.split('.')[-1].lower()
+        media_type_map = {
+            'mp4': 'video/mp4',
+            'webm': 'video/webm',
+            'mkv': 'video/x-matroska',
+            'mp3': 'audio/mpeg',
+            'wav': 'audio/wav',
+            'ogg': 'audio/ogg'
+        }
+        
+        media_type = media_type_map.get(ext, 'application/octet-stream')
+        
+        return FileResponse(
+            filepath,
+            media_type=media_type,
+            filename=filename
+        )
+    except Exception as e:
+        logger.error(f"Download file error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to download file")
 
 @app.post("/api/debug/test-audio-mixing")
 async def test_audio_mixing(current_user: dict = Depends(get_current_user)):

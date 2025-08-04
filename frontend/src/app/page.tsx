@@ -12,7 +12,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert"
 import { useFormInput } from "@/hooks/use-form-input"
 import { Progress } from "@/components/ui/progress"
 
-type Page = "chatbot" | "photo-editor" | "text-to-speech" | "file-upload" | "login" | "signup"
+type Page = "chatbot" | "photo-editor" | "text-to-speech" | "youtube-downloader" | "login" | "signup"
 type AppUser = { username: string; email: string } | null
 
 interface Activity {
@@ -37,6 +37,19 @@ interface TTSResponse {
   selected_track: string;
 }
 
+interface YouTubeInfo {
+  title: string;
+  duration: number;
+  uploader: string;
+  view_count: number;
+  formats: Array<{
+    quality: string;
+    format_id: string;
+    ext: string;
+  }>;
+  thumbnail: string;
+}
+
 // Simple form state management without external hook
 function useSimpleForm<T>(initialValues: T) {
   const [values, setValues] = useState<T>(initialValues)
@@ -59,6 +72,7 @@ export default function AIToolsHub() {
   const [activities, setActivities] = useState<Activity[]>([])
   const [loading, setLoading] = useState(false)
   const [authToken, setAuthToken] = useState<string | null>(null)
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
   // Photo Editor state
   const [uploadedImage, setUploadedImage] = useState<string | null>(null)
@@ -94,6 +108,15 @@ export default function AIToolsHub() {
   })
   const [authError, setAuthError] = useState("")
 
+  // YouTube Downloader state
+  const youtubeForm = useFormInput({ url: "" })
+  const [youtubeInfo, setYoutubeInfo] = useState<YouTubeInfo | null>(null)
+  const [selectedVideoQuality, setSelectedVideoQuality] = useState("720p")
+  const [selectedAudioFormat, setSelectedAudioFormat] = useState("mp3")
+  const [downloadProgress, setDownloadProgress] = useState(0)
+  const [downloadType, setDownloadType] = useState<"video" | "audio">("video")
+  const [downloadedFile, setDownloadedFile] = useState<string | null>(null)
+
   // API Base URL
   const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000"
 
@@ -127,7 +150,7 @@ export default function AIToolsHub() {
       chatbot: "chat",
       "photo-editor": "photo_edit",
       "text-to-speech": "text_to_speech",
-      "file-upload": "file_upload",
+      "youtube-downloader": "youtube_download",
       login: "",
       signup: "",
     }
@@ -564,6 +587,117 @@ export default function AIToolsHub() {
     }
   }, [authToken, selectedVoice])
 
+  // YouTube Downloader Functions
+  const getYouTubeInfo = useCallback(async () => {
+    if (!youtubeForm.values.url.trim() || !user) return
+
+    setLoading(true)
+    setYoutubeInfo(null)
+    setDownloadedFile(null)
+
+    try {
+      const response = await fetch(`${API_BASE}/api/youtube-info`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({
+          url: youtubeForm.values.url,
+        }),
+      })
+
+      const data = await response.json()
+
+      if (response.ok) {
+        setYoutubeInfo(data.info)
+        console.log("Video info received:", data.info) // Debug log
+        if (data.info.formats && data.info.formats.length > 0) {
+          console.log("Available formats:", data.info.formats) // Debug log
+          setSelectedVideoQuality(data.info.formats[0].quality)
+        }
+      } else {
+        alert(`Failed to get video info: ${data.error || "Unknown error"}`)
+      }
+    } catch (error) {
+      console.error("YouTube info error:", error)
+      alert("Failed to get video information. Please try again.")
+    } finally {
+      setLoading(false)
+    }
+  }, [youtubeForm.values.url, user, authToken])
+
+  const downloadYouTubeContent = useCallback(
+  async (type: "video" | "audio") => {
+    if (!youtubeForm.values.url.trim() || !user) return;
+
+    setLoading(true);
+    setDownloadProgress(0);
+    setDownloadType(type);
+    setDownloadedFile(null);
+    setPreviewUrl(null); // reset any previous preview
+
+    // progress bar simulation
+    const progressInterval = setInterval(() => {
+      setDownloadProgress((prev) => {
+        if (prev >= 90) {
+          clearInterval(progressInterval);
+          return 90;
+        }
+        return prev + 10;
+      });
+    }, 1000);
+
+    try {
+      const endpoint =
+        type === "video"
+          ? "/api/youtube-download/video"
+          : "/api/youtube-download/audio";
+
+      const body =
+        type === "video"
+          ? { url: youtubeForm.values.url, quality: selectedVideoQuality }
+          : { url: youtubeForm.values.url, format: selectedAudioFormat };
+
+      const response = await fetch(`${API_BASE}${endpoint}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify(body),
+      });
+
+      clearInterval(progressInterval);
+      setDownloadProgress(100);
+
+      const data = await response.json();
+
+      if (response.ok) {
+        setDownloadedFile(data.filename);
+        setPreviewUrl(`${API_BASE}${data.download_url}`); // store for inline preview
+        fetchActivities();
+      } else {
+        alert(`Download failed: ${data.error || "Unknown error"}`);
+      }
+    } catch (error) {
+      console.error("Download error:", error);
+      alert("Download failed. Please try again.");
+    } finally {
+      setLoading(false);
+      setTimeout(() => setDownloadProgress(0), 2000);
+    }
+  },
+  [
+    youtubeForm.values.url,
+    user,
+    authToken,
+    selectedVideoQuality,
+    selectedAudioFormat,
+    fetchActivities,
+  ]
+);
+
   const Navigation = useCallback(
     () => (
       <nav className="bg-white shadow-sm border-b">
@@ -592,12 +726,12 @@ export default function AIToolsHub() {
                     Text to Speech
                   </Button>
                   <Button
-                    variant={currentPage === "file-upload" ? "default" : "ghost"}
-                    onClick={() => setCurrentPage("file-upload")}
+                    variant={currentPage === "youtube-downloader" ? "default" : "ghost"}
+                    onClick={() => setCurrentPage("youtube-downloader")}
                     className="flex items-center gap-2"
                   >
-                    <Upload size={16} />
-                    File Upload
+                    <Download size={16} />
+                    YouTube Downloader
                   </Button>
                 </div>
               )}
@@ -643,7 +777,7 @@ export default function AIToolsHub() {
       <CardHeader>
         <CardTitle className="text-lg">Recent Activity</CardTitle>
       </CardHeader>
-      <CardContent className="space-y-3 max-h-96 overflow-y-auto">
+      <CardContent className="space-y-3 max-h-152 overflow-y-auto">
         {activities.length > 0 ? (
           activities.map((activity, index) => (
             <div key={activity.id || index} className="p-3 bg-gray-50 rounded-lg">
@@ -674,6 +808,14 @@ export default function AIToolsHub() {
                   <div>
                     <div>Text: {activity.details?.text?.substring(0, 50)}...</div>
                     <div>Voice: {activity.details?.voice}</div>
+                  </div>
+                )}
+                {activity.activity_type === "youtube_download" && (
+                  <div>
+                    <div>Type: {activity.details?.type}</div>
+                    <div>Title: {activity.details?.title?.substring(0, 50)}...</div>
+                    {activity.details?.quality && <div>Quality: {activity.details.quality}</div>}
+                    {activity.details?.format && <div>Format: {activity.details.format}</div>}
                   </div>
                 )}
               </div>
@@ -812,7 +954,7 @@ export default function AIToolsHub() {
             </CardHeader>
             <CardContent>
               <div
-                className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors ${
+                className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors space-y-23 ${
                   dragActive
                     ? "border-blue-500 bg-blue-50"
                     : uploadedImage
@@ -839,7 +981,7 @@ export default function AIToolsHub() {
                     </Button>
                   </div>
                 ) : (
-                  <div className="space-y-4">
+                  <div className="space-y-25">
                     <Upload className="mx-auto h-12 w-12 text-gray-400" />
                     <div>
                       <p className="text-lg font-medium text-gray-700">
@@ -864,7 +1006,7 @@ export default function AIToolsHub() {
             <CardHeader>
               <CardTitle>Transformation Options</CardTitle>
             </CardHeader>
-            <CardContent className="space-y-4">
+            <CardContent className="space-y-15">
               <Select value={selectedTransform} onValueChange={setSelectedTransform}>
                 <SelectTrigger>
                   <SelectValue placeholder="Select transformation" />
@@ -1084,39 +1226,181 @@ export default function AIToolsHub() {
     ],
   )
 
-  const FileUploadPage = useMemo(
-    () => (
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-[calc(100vh-8rem)]">
-        <div className="lg:col-span-2">
-          <Card className="h-full">
+  const YouTubeDownloaderPage = useMemo(
+  () => (
+    <div className="flex flex-col h-[calc(100vh-8rem)]">
+      {/* Row 1 : sidebar + download options */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 shrink-0">
+        {/* Download options (left) */}
+        <div className="lg:col-span-2 space-y-6">
+          <Card>
             <CardHeader>
-              <CardTitle>File Upload</CardTitle>
+              <CardTitle>YouTube Video & Audio Downloader</CardTitle>
             </CardHeader>
-            <CardContent>
-              <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center bg-gray-50">
-                <Upload className="mx-auto h-12 w-12 text-gray-400" />
-                <p className="mt-2 text-sm text-gray-600">Drag and drop files here or click to upload</p>
-                <p className="text-xs text-gray-500 mt-1">Supports: TXT, PDF, DOC, DOCX, JPG, PNG, MP3, WAV</p>
-                <input
-                  type="file"
-                  accept=".txt,.pdf,.doc,.docx,.jpg,.png,.mp3,.wav"
-                  className="hidden"
-                  id="file-upload"
-                />
-                <label htmlFor="file-upload" className="cursor-pointer">
-                  <Button className="mt-4" variant="outline">
-                    Choose Files
-                  </Button>
-                </label>
-              </div>
+            <CardContent className="space-y-4">
+              <Input
+                name="url"
+                placeholder="https://www.youtube.com/watch?v=..."
+                value={youtubeForm.values.url}
+                onChange={youtubeForm.handleChange}
+              />
+              <Button
+                onClick={getYouTubeInfo}
+                disabled={!youtubeForm.values.url.trim() || loading}
+                className="w-full"
+              >
+                {loading ? "Getting Video Info..." : "Get Video Information"}
+              </Button>
             </CardContent>
           </Card>
+
+          {youtubeInfo && (
+            <>
+              <Card>
+                <CardHeader>
+                  <CardTitle>Video Information</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="flex gap-4">
+                    {youtubeInfo.thumbnail && (
+                      <img
+                        src={youtubeInfo.thumbnail}
+                        alt="Thumbnail"
+                        className="w-32 h-24 object-cover rounded"
+                      />
+                    )}
+                    <div className="flex-1">
+                      <h3 className="font-semibold text-lg">{youtubeInfo.title}</h3>
+                      <p className="text-sm text-gray-600">
+                        By: {youtubeInfo.uploader} • {Math.floor(youtubeInfo.duration / 60)}:
+                        {(youtubeInfo.duration % 60).toString().padStart(2, "0")} •{" "}
+                        {youtubeInfo.view_count?.toLocaleString()} views
+                      </p>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>Download Options</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-6">
+                  <div className="space-y-4">
+                    <h3 className="font-medium">Download Video</h3>
+                    <Select
+                      value={selectedVideoQuality}
+                      onValueChange={setSelectedVideoQuality}
+                    >
+                      <SelectContent>
+                        {youtubeInfo.formats.map((f) => (
+                          <SelectItem key={f.quality} value={f.quality}>
+                            {f.quality} ({f.ext})
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <Button
+                      onClick={() => downloadYouTubeContent("video")}
+                      disabled={loading}
+                      className="w-full"
+                    >
+                      {loading && downloadType === "video"
+                        ? "Downloading Video..."
+                        : "Download Video"}
+                    </Button>
+                  </div>
+
+                  <div className="border-t pt-4 space-y-4">
+                    <h3 className="font-medium">Download Audio Only</h3>
+                    <Select
+                      value={selectedAudioFormat}
+                      onValueChange={setSelectedAudioFormat}
+                    >
+                      <SelectContent>
+                        <SelectItem value="mp3">MP3</SelectItem>
+                        <SelectItem value="wav">WAV</SelectItem>
+                        <SelectItem value="ogg">OGG</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Button
+                      onClick={() => downloadYouTubeContent("audio")}
+                      disabled={loading}
+                      className="w-full"
+                      variant="outline"
+                    >
+                      {loading && downloadType === "audio"
+                        ? "Downloading Audio..."
+                        : "Download Audio"}
+                    </Button>
+                  </div>
+
+                  {downloadProgress > 0 && downloadProgress < 100 && (
+                    <div>
+                      <div className="flex justify-between text-sm">
+                        <span>Downloading {downloadType}...</span>
+                        <span>{downloadProgress}%</span>
+                      </div>
+                      <Progress value={downloadProgress} className="w-full" />
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            </>
+          )}
         </div>
+
+        {/* Sidebar – history stops here */}
         <ActivityHistory />
       </div>
-    ),
-    [],
-  )
+
+      {/* Row 2 : full-width preview (only when ready) */}
+      {previewUrl && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80">
+          <div className="w-[90vw] h-[85vh] flex flex-col bg-white rounded-lg shadow-2xl p-4 sm:p-6">
+            {downloadType === "video" ? (
+              <video
+                src={previewUrl}
+                controls
+                autoPlay
+                className="w-full h-full object-contain rounded"
+              />
+            ) : (
+              <audio
+                src={previewUrl}
+                controls
+                autoPlay
+                className="w-full h-full"
+              />
+            )}
+            <div className="mt-4 flex justify-center gap-4">
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  setPreviewUrl(null);
+                  setDownloadedFile(null);
+                }}
+              >
+                Close
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  ),
+  [
+    youtubeForm.values.url,
+    loading,
+    youtubeInfo,
+    selectedVideoQuality,
+    selectedAudioFormat,
+    downloadType,
+    downloadProgress,
+    downloadedFile,
+    previewUrl,
+  ]
+)
 
   // Simplified render function
   const renderCurrentPage = () => {
@@ -1133,6 +1417,8 @@ export default function AIToolsHub() {
         return PhotoEditorPage
       case "text-to-speech":
         return TextToSpeechPage
+      case "youtube-downloader":
+        return YouTubeDownloaderPage
       default:
         return LoginPage
     }
