@@ -5,7 +5,7 @@ Enhanced FastAPI server with proper audio file handling and background music mix
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List, Dict, Any
@@ -81,7 +81,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 30
 # Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://your-domain.com"],
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -157,6 +157,9 @@ class UserResponse(BaseModel):
     username: str
     email: str
 
+class YouTubeInfoRequest(BaseModel):   # new model
+    url: str
+
 # Utility functions
 def hash_password(password: str) -> str:
     """Hash password using SHA256"""
@@ -193,6 +196,8 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         if username is None:
             raise HTTPException(status_code=401, detail="Invalid authentication credentials")
         return username
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid authentication credentials")
 
@@ -453,6 +458,7 @@ def validate_youtube_url(url: str) -> bool:
         r'(?:https?://)?(?:www\.)?youtu\.be/[\w-]+',
         r'(?:https?://)?(?:www\.)?youtube\.com/embed/[\w-]+',
         r'(?:https?://)?(?:www\.)?youtube\.com/v/[\w-]+',
+        r'(?:https?://)?(?:www\.)?youtube\.com/shorts/[\w-]+',
     ]
     
     for pattern in youtube_patterns:
@@ -608,6 +614,7 @@ def download_youtube_audio(url: str, format: str = "mp3", output_dir: str = "tem
                 'preferredcodec': format,
                 'preferredquality': '192',
             }],
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -1259,22 +1266,26 @@ async def test_audio_mixing(current_user: dict = Depends(get_current_user)):
 # Error handlers
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc):
-    """Custom HTTP exception handler"""
     logger.error(f"HTTP {exc.status_code}: {exc.detail}")
-    return {"error": exc.detail, "status_code": exc.status_code}
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.detail, "status_code": exc.status_code}
+    )
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request, exc):
-    """General exception handler"""
     logger.error(f"Unhandled exception: {exc}")
-    return {"error": "Internal server error", "status_code": 500}
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error", "status_code": 500}
+    )
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         "api_server:app", 
         host="0.0.0.0", 
-        port=8000, 
+        port=8001, 
         reload=True,
         log_level="debug"
     )
